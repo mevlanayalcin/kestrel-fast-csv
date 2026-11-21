@@ -16,8 +16,11 @@
 // (long_row) to the first record's width; each error carries the 1-based line its record starts on and its row.
 //
 // readCore copies eight bytes a step (DataView, little-endian) and finds the next comma, quote or backslash in them
-// by the SWAR zero-byte test. Module state is held in var bindings, which V8 reads without the hole checks a module's
-// let and const bindings need.
+// by the SWAR zero-byte test, picking the first of the two words that holds one without a branch. It holds only what
+// most fields meet; the rest is in small functions it calls, which V8 runs unoptimised. What those return is truncated
+// to int32 (| 0) where it flows back into readCore's positions, so V8 keeps them as untagged int32 in registers rather
+// than as checked small integers. Module state is held in var bindings, which V8 reads without the hole checks a
+// module's let and const bindings need.
 
 var E_STRAY = 0;
 var E_JUNK = 1;
@@ -43,6 +46,9 @@ var UNREADABLE = new Error('bytes this reader does not take');
 /** readCore's answer when the window ends inside a record: read more, then read again from `resume`. */
 var NEED_MORE = -1;
 
+/** readCore's answer when the output moved to a larger buffer at a record's end: read on from `resume`. */
+var MOVED = -2;
+
 // ---- The input window ----
 // src holds bytes srcBase onward of the input, `wlen` of them, then PAD quotes: the reader takes a quote it meets at or
 // past `sentinel` (wlen, or NO_END once the input has ended) for the window's end rather than the text's.
@@ -53,6 +59,8 @@ var srcBase = 0;
 var eof = true;
 var sentinel = NO_END;
 var readFn = null;
+/** How many bytes a refill puts in src at most: the window's length. */
+var cap = 0;
 
 // ---- The output window ----
 // out holds the output from outBase on, `o` bytes of it; past outLimit it is handed to writeFn at a record's start.
@@ -88,8 +96,10 @@ var extras = new Uint8Array(1 << 16);
 var nextras = 0;
 
 function setWindow(bytes, n, ended) {
-  src = bytes;
-  srcView = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+  if (bytes !== src) {
+    src = bytes;
+    srcView = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+  }
   wlen = n;
   eof = ended;
   src.fill(0x22, n, n + PAD);
@@ -100,16 +110,20 @@ function setWindow(bytes, n, ended) {
 function refill(from) {
   let buf = src;
   const keep = wlen - from;
-  if (from === 0 && keep + PAD >= buf.length) {
-    buf = new Uint8Array(buf.length * 2);
-    buf.set(src.subarray(0, keep));
-    room(3 * buf.length);
+  if (from === 0 && keep >= cap) {
+    // A record longer than the window: a window twice as long.
+    cap *= 2;
+    if (cap + PAD > buf.length) {
+      buf = new Uint8Array(cap + PAD);
+      buf.set(src.subarray(0, keep));
+    }
+    room(3 * (cap + PAD));
   } else buf.copyWithin(0, from, wlen);
   srcBase += from;
   let n = keep;
   let ended = eof;
-  while (!ended && n < buf.length - PAD) {
-    const r = readFn(buf, n, buf.length - PAD - n, srcBase + n);
+  while (!ended && n < cap) {
+    const r = readFn(buf, n, cap - n, srcBase + n);
     if (r <= 0) ended = true;
     else n += r;
   }
@@ -247,222 +261,329 @@ function beginCase() {
   nextras = 0;
 }
 
-/**
- * Reads the case's CSV text from src[start] on and writes its records. Returns the index of the closing quote of the
- * text's literal, or NEED_MORE when the window ends inside a record: the case's state is then as it was at that
- * record's start, src[resume], which the caller reads on from once the window holds more.
- */
-function readCore(start) {
-  // The SWAR constants, as locals (module variables would be loaded on every use).
-  const ONES = 0x01010101;
-  const HIGHS = -0x7f7f7f80; // 0x80808080
-  const COMMAS = 0x2c2c2c2c;
-  const QUOTES = 0x22222222;
-  const SLASHES = 0x5c5c5c5c;
-  const s = src;
-  const sv = srcView;
-  const sent = sentinel;
-  let dv = outView;
-  let oo = o;
-  let k = kept;
-  let wd = width;
-  let line = cLine;
-  let i = start;
+/** Where a cold helper leaves the output position it wrote up to. */
+var co = 0;
 
-  for (;;) {
-    // A record's start.
-    if (oo > outLimit) {
-      o = oo;
-      flush();
-      oo = o;
-    }
-    rI = i;
-    rO = oo;
-    rN = nerr;
-    rL = line;
-    // Lines with no characters are no records.
-    while (s[i] === 0x5c) {
-      if (s[i + 1] === 0x6e) i += 2;
-      else if (s[i + 1] === 0x72 && s[i + 2] === 0x5c && s[i + 3] === 0x6e) i += 4;
-      else break;
-      line++;
-    }
-    let ended = 0; // 1 a line break, 2 the end of the text, 3 the end of the window
-    if (s[i] === 0x22) {
-      if (i < sent) break; // the end of the text
-      ended = 3;
-    }
-    rLineOf = line;
-    if (k >= 2) dv.setInt8(oo++, 0x2c);
-    dv.setInt16(oo, 0x225b, true); // ["
-    oo += 2;
-    let nf = 0;
-    // The field being read: where its value starts, whether it opened with a quote (and where), where what follows
-    // its closing quote starts (-1: none), and the scan's comma mask (0 inside quotes, where a comma is text).
-    let fieldStart = oo;
-    let quoted = s[i] === 0x5c && s[i + 1] === 0x22;
-    rOpenI = i + 2;
-    rOpenLine = line;
-    let junkStart = -1;
-    let cm = HIGHS;
-    if (quoted) {
-      i += 2;
-      cm = 0;
-    }
-    while (ended === 0) {
-      // Copy up to the next quote, backslash or (outside quotes) comma, eight bytes a step.
-      let n = 0;
-      for (;;) {
-        const w = sv.getInt32(i, true);
-        const x = sv.getInt32(i + 4, true);
-        const a = w ^ COMMAS;
-        const b = w ^ QUOTES;
-        const d = w ^ SLASHES;
-        let m = (((a - ONES) & ~a) & cm) | ((b - ONES) & ~b) | ((d - ONES) & ~d);
-        m &= HIGHS;
-        const a2 = x ^ COMMAS;
-        const b2 = x ^ QUOTES;
-        const d2 = x ^ SLASHES;
-        let m2 = (((a2 - ONES) & ~a2) & cm) | ((b2 - ONES) & ~b2) | ((d2 - ONES) & ~d2);
-        m2 &= HIGHS;
-        dv.setInt32(oo, w, true);
-        dv.setInt32(oo + 4, x, true);
-        if (m !== 0) {
-          n = (31 - Math.clz32(m & -m)) >> 3;
-          break;
-        }
-        if (m2 !== 0) {
-          n = 4 + ((31 - Math.clz32(m2 & -m2)) >> 3);
-          break;
-        }
-        i += 8;
-        oo += 8;
+// ---- The reader ----
+// readCore is made for one input window and one output buffer (src and out, and their views), which it holds as
+// constants: a function V8 has only ever made one closure of is optimised for that closure's own variables, so the
+// views' maps and the window's place are known to the compiled code rather than checked and loaded at every step.
+// answerCases reads every cases file through the same two buffers, so the reader warmed and compiled in prepare() is
+// the one main() runs. When either buffer is replaced (a window or an output that has to grow, or run()'s own), the
+// next call makes another closure, which V8 then runs without that.
+
+var core = null;
+var coreSrc = null;
+var coreOut = null;
+
+/** The reader for src and out as they are now. */
+function reader() {
+  if (core === null || coreSrc !== src || coreOut !== out) {
+    coreSrc = src;
+    coreOut = out;
+    core = makeReadCore(src, srcView, outView);
+  }
+  return core;
+}
+
+/** The reader of the window s (its view sv) that writes through dv, the output's view. */
+function makeReadCore(s, sv, dv) {
+  return readCore;
+
+  /**
+   * Reads the case's CSV text from src[start] on and writes its records. Returns the index of the closing quote of the
+   * text's literal, or NEED_MORE when the window ends inside a record: the case's state is then as it was at that
+   * record's start, src[resume], which the caller reads on from once the window holds more; or MOVED when the output
+   * moved to a larger buffer, which this reader does not write: the caller reads on from src[resume] with another.
+   *
+   * Only what most fields meet is here (commas, line breaks, quoted fields with "" and line breaks in them); the rest
+   * (a stray CR, junk after a closing quote, a quote that never closes, other escapes, a short or long row) is in small
+   * functions of its own, so the optimised code of this one stays small.
+   */
+  function readCore(start) {
+    // The SWAR constants, as locals (module variables would be loaded on every use).
+    const ONES = 0x01010101;
+    const HIGHS = -0x7f7f7f80; // 0x80808080
+    const COMMAS = 0x2c2c2c2c;
+    const QUOTES = 0x22222222;
+    const SLASHES = 0x5c5c5c5c;
+    const sent = sentinel;
+    let oo = o | 0;
+    let k = kept | 0;
+    let wd = width | 0;
+    let line = cLine | 0;
+    let i = start | 0;
+
+    for (;;) {
+      // A record's start.
+      if (oo > outLimit) {
+        o = oo;
+        flush();
+        oo = o | 0;
       }
-      i += n;
-      oo += n;
-      const c = s[i];
-      if (c === 0x2c) {
-        // A comma outside quotes: the field ends and the next begins.
-        i++;
-        if (junkStart >= 0 && oo > junkStart) pushErr(E_JUNK, rLineOf, k, 0, 0);
-        nf++;
-        if (nf === wd) {
-          rCut = oo;
-          rExtra = oo + 3;
-        }
-        dv.setInt32(oo, 0x222c22, true); // ","
-        oo += 3;
-        fieldStart = oo;
-        junkStart = -1;
-        quoted = s[i] === 0x5c && s[i + 1] === 0x22;
-        if (quoted) {
-          i += 2;
-          rOpenI = i;
-          rOpenLine = line;
-          cm = 0;
-        } else cm = HIGHS;
-      } else if (c === 0x22) {
-        // The literal's closing quote: the end of the window, or of the text.
-        if (i >= sent) ended = 3;
-        else if (cm !== 0) ended = 2;
-        else {
-          // The quote never closes: a literal quote, and the text after it read again unquoted.
-          oo = fieldStart;
-          dv.setInt16(oo, 0x225c, true); // \"
-          oo += 2;
-          i = rOpenI;
-          line = rOpenLine;
-          pushErr(E_UNTERM, rLineOf, k, 0, 0);
-          cm = HIGHS;
-        }
-      } else if (i + 8 > sent) {
-        // An escape at the window's end: read it once the window holds the bytes after it.
+      rI = i;
+      rO = oo;
+      rN = nerr;
+      rL = line;
+      // Lines with no characters are no records.
+      while (s[i] === 0x5c) {
+        if (s[i + 1] === 0x6e) i += 2;
+        else if (s[i + 1] === 0x72 && s[i + 2] === 0x5c && s[i + 3] === 0x6e) i += 4;
+        else break;
+        line++;
+      }
+      let ended = 0; // 1 a line break, 2 the end of the text, 3 the end of the window
+      if (s[i] === 0x22) {
+        if (i < sent) break; // the end of the text
         ended = 3;
-      } else {
-        const e = s[i + 1];
-        if (e === 0x6e) {
-          i += 2;
-          line++;
-          if (cm !== 0) ended = 1;
-          else {
-            dv.setInt16(oo, 0x6e5c, true); // \n
-            oo += 2;
+      }
+      rLineOf = line;
+      if (k >= 2) dv.setInt8(oo++, 0x2c);
+      dv.setInt16(oo, 0x225b, true); // ["
+      oo += 2;
+      let nf = 0;
+      // The field being read: where its value starts, and the scan's comma mask (0 inside quotes, where a comma is
+      // text). `quoted`: whether the record's first field opens with a quote.
+      let fieldStart = oo;
+      const quoted = s[i] === 0x5c && s[i + 1] === 0x22;
+      let cm = HIGHS;
+      if (quoted) {
+        i += 2;
+        rOpenI = i;
+        rOpenLine = line;
+        cm = 0;
+      }
+      while (ended === 0) {
+        // Copy up to the next quote, backslash or (outside quotes) comma, eight bytes a step.
+        let n = 0;
+        for (;;) {
+          const w = sv.getInt32(i, true);
+          const x = sv.getInt32(i + 4, true);
+          const a = w ^ COMMAS;
+          const b = w ^ QUOTES;
+          const d = w ^ SLASHES;
+          const m = (((a - ONES) & cm) | (b - ONES) | (d - ONES)) & ~w & HIGHS;
+          const a2 = x ^ COMMAS;
+          const b2 = x ^ QUOTES;
+          const d2 = x ^ SLASHES;
+          const m2 = (((a2 - ONES) & cm) | (b2 - ONES) | (d2 - ONES)) & ~x & HIGHS;
+          dv.setInt32(oo, w, true);
+          dv.setInt32(oo + 4, x, true);
+          if ((m | m2) !== 0) {
+            // The first of them: in w when m is not 0, else in x (no branch, which the CPU would mispredict).
+            const z = (m | -m) >> 31;
+            n = (((31 - Math.clz32(m & -m)) >> 3) & z) | ((4 + ((31 - Math.clz32(m2 & -m2)) >> 3)) & ~z);
+            break;
           }
-        } else if (e === 0x72) {
-          i += 2;
-          if (s[i] === 0x5c && s[i + 1] === 0x75) checkLf(s, i);
-          const lf = s[i] === 0x5c && s[i + 1] === 0x6e;
-          if (cm !== 0) {
-            if (lf) {
-              // CRLF
-              i += 2;
-              line++;
-              ended = 1;
-            } else pushErr(E_STRAY, rLineOf, k, 0, 0); // a CR not followed by LF, outside quotes: dropped
-          } else {
-            // CRLF or a lone CR inside quotes: one LF
-            if (lf) i += 2;
-            line++;
-            dv.setInt16(oo, 0x6e5c, true); // \n
-            oo += 2;
+          i = (i + 8) | 0;
+          oo = (oo + 8) | 0;
+        }
+        i = (i + n) | 0;
+        oo = (oo + n) | 0;
+        let c = s[i];
+        if (c === 0x5c && cm === 0) {
+          // An escape inside quotes.
+          if (i + 8 > sent) {
+            // An escape at the window's end: read it once the window holds the bytes after it.
+            ended = 3;
+            break;
           }
-        } else if (e === 0x22 && cm === 0) {
-          if (s[i + 2] === 0x5c && s[i + 3] === 0x22) {
-            // "" inside quotes: one quote
-            dv.setInt16(oo, 0x225c, true); // \"
-            oo += 2;
-            i += 4;
-          } else {
-            // The closing quote: what follows it up to the next comma or line break is appended.
+          const e = s[i + 1];
+          if (e === 0x22) {
+            if (s[i + 2] === 0x5c && s[i + 3] === 0x22) {
+              // "" inside quotes: one quote
+              dv.setInt16(oo, 0x225c, true); // \"
+              oo += 2;
+              i += 4;
+              continue;
+            }
+            // The closing quote: a comma, a line break or the text's end follows, or what follows it up to the next
+            // comma or line break is appended (junk).
             i += 2;
             cm = HIGHS;
-            junkStart = oo;
+            c = s[i];
+            const lineBreak =
+              c === 0x5c && (s[i + 1] === 0x6e || (s[i + 1] === 0x72 && s[i + 2] === 0x5c && s[i + 3] === 0x6e));
+            if (c !== 0x2c && c !== 0x22 && !lineBreak) {
+              i = junk(i, oo, k) | 0;
+              oo = co | 0;
+              c = s[i];
+            }
+            if (c !== 0x2c) continue;
+          } else {
+            if (e === 0x6e) {
+              i += 2;
+            } else if (e === 0x72) {
+              // CRLF or a lone CR inside quotes: one LF
+              i += 2;
+              if (s[i] === 0x5c) {
+                if (s[i + 1] === 0x6e) i += 2;
+                else if (s[i + 1] === 0x75) checkLf(s, i);
+              }
+            } else {
+              i = copyEscape(i, oo) | 0;
+              oo = co | 0;
+              continue;
+            }
+            dv.setInt16(oo, 0x6e5c, true); // \n
+            oo += 2;
+            line++;
+            continue;
           }
-        } else if (e === 0x75) {
-          copyU(s, i, out, oo);
-          oo += 6;
-          i += 6;
+        }
+        if (c === 0x2c) {
+          // A comma outside quotes: the field ends and the next begins.
+          i++;
+          nf++;
+          if (nf === wd) {
+            rCut = oo;
+            rExtra = oo + 3;
+          }
+          dv.setInt32(oo, 0x222c22, true); // ","
+          oo += 3;
+          fieldStart = oo;
+          if (s[i] === 0x5c && s[i + 1] === 0x22) {
+            i += 2;
+            rOpenI = i;
+            rOpenLine = line;
+            cm = 0;
+          }
+        } else if (c === 0x22) {
+          // The literal's closing quote: the end of the window, or of the text (or a quote that never closes).
+          if (i >= sent) ended = 3;
+          else if (cm !== 0) ended = 2;
+          else {
+            i = unterminated(fieldStart, k) | 0;
+            oo = fieldStart + 2;
+            line = rOpenLine | 0;
+            cm = HIGHS;
+          }
+        } else if (i + 8 > sent) {
+          ended = 3;
         } else {
-          // Any other escape stands as it is (and outside quotes \" too: a quote in an unquoted field is text).
-          dv.setInt16(oo, 0x5c | (e << 8), true);
-          oo += 2;
-          i += 2;
+          // An escape outside quotes.
+          const e = s[i + 1];
+          if (e === 0x6e) {
+            i += 2;
+            line++;
+            ended = 1;
+          } else if (e === 0x72 && s[i + 2] === 0x5c && s[i + 3] === 0x6e) {
+            // CRLF
+            i += 4;
+            line++;
+            ended = 1;
+          } else {
+            // A CR not followed by LF is dropped (stray_cr); any other escape stands as it is (\" too: a quote in an
+            // unquoted field is text).
+            if (e === 0x72) i = strayCr(i, k) | 0;
+            else {
+              i = copyEscape(i, oo) | 0;
+              oo = co | 0;
+            }
+          }
         }
       }
-    }
 
-    if (ended === 3) {
-      // The window ends inside this record: read it again once there is more.
-      nerr = rN;
-      resume = rI;
-      cLine = rL;
-      o = rO;
-      kept = k;
-      return NEED_MORE;
-    }
-    // The record ends.
-    if (junkStart >= 0 && oo > junkStart) pushErr(E_JUNK, rLineOf, k, 0, 0);
-    nf++;
-    if (nf === 1 && oo === fieldStart && !quoted) {
-      // A line that held only stray CRs: no record (its stray_cr errors stay).
-      oo = rO;
-    } else {
-      if (nf === wd) {
-        dv.setInt16(oo, 0x5d22, true); // "]
-        oo += 2;
-      } else {
-        oo = endRecord(oo, nf, rCut, rExtra, rLineOf, k);
-        dv = outView;
-        wd = width;
+      if (ended === 3) {
+        // The window ends inside this record: read it again once there is more.
+        nerr = rN;
+        resume = rI;
+        cLine = rL;
+        o = rO;
+        kept = k;
+        return NEED_MORE;
       }
-      k++;
+      // The record ends.
+      nf++;
+      if (nf === 1 && oo === fieldStart && !quoted) {
+        // A line that held only stray CRs: no record (its stray_cr errors stay).
+        oo = rO;
+      } else {
+        if (nf === wd) {
+          dv.setInt16(oo, 0x5d22, true); // "]
+          oo += 2;
+        } else {
+          oo = endRecord(oo, nf, rCut, rExtra, rLineOf, k) | 0;
+          wd = width | 0;
+        }
+        k++;
+      }
+      if (ended === 2) break;
+      if (outView !== dv) {
+        // endRecord moved the output to a larger buffer.
+        kept = k;
+        cLine = line;
+        o = oo;
+        resume = i;
+        return MOVED;
+      }
     }
-    if (ended === 2) break;
+    kept = k;
+    cLine = line;
+    o = oo;
+    return i;
   }
-  kept = k;
-  cLine = line;
-  o = oo;
+}
+
+/** A CR not followed by LF, outside quotes, at i: dropped (stray_cr). Returns where reading goes on. */
+function strayCr(i, rec) {
+  pushErr(E_STRAY, rLineOf, rec, 0, 0);
+  i += 2;
+  if (src[i] === 0x5c && src[i + 1] === 0x75) checkLf(src, i);
   return i;
+}
+
+/** Copies the escape at i to the output at oo as it stands; returns where reading goes on (co: the output's). */
+function copyEscape(i, oo) {
+  if (src[i + 1] === 0x75) {
+    copyU(src, i, out, oo);
+    co = oo + 6;
+    return i + 6;
+  }
+  out[oo] = 0x5c;
+  out[oo + 1] = src[i + 1];
+  co = oo + 2;
+  return i + 2;
+}
+
+/**
+ * What follows a closing quote at i, up to the next comma or line break (or the end of the text or the window), is
+ * appended as it stands to the field, a CR not followed by LF dropped (stray_cr); when it is not empty, quote_junk.
+ * Returns where reading goes on, at what ended it (co: where the output goes on).
+ */
+function junk(i, oo, rec) {
+  const s = src;
+  const from = oo;
+  for (;;) {
+    const c = s[i];
+    if (c === 0x2c || c === 0x22) break;
+    if (c === 0x5c) {
+      if (i + 8 > sentinel) break;
+      const e = s[i + 1];
+      if (e === 0x6e) break;
+      if (e === 0x72) {
+        if (s[i + 2] === 0x5c && s[i + 3] === 0x6e) break;
+        i = strayCr(i, rec);
+        continue;
+      }
+      i = copyEscape(i, oo);
+      oo = co;
+      continue;
+    }
+    out[oo++] = c;
+    i++;
+  }
+  if (oo > from) pushErr(E_JUNK, rLineOf, rec, 0, 0);
+  co = oo;
+  return i;
+}
+
+/** A quote that never closes, its field's value at `at`: a literal quote, and the text after it read again unquoted. */
+function unterminated(at, rec) {
+  out[at] = 0x5c;
+  out[at + 1] = 0x22;
+  pushErr(E_UNTERM, rLineOf, rec, 0, 0);
+  return rOpenI;
 }
 
 /** Refuses a \u escape of an LF after a CR (JSON.stringify writes an LF as \n). */
@@ -601,13 +722,15 @@ function text() {
   if (src[i] === 0xef && src[i + 1] === 0xbb && src[i + 2] === 0xbf) i += 3;
   else if (src[i] === 0x5c && src[i + 1] === 0x75 && hex4(src, i) === 0xfeff) throw UNREADABLE;
   for (;;) {
-    const r = readCore(i);
-    if (r !== NEED_MORE) {
+    const r = reader()(i);
+    if (r === MOVED) i = resume;
+    else if (r !== NEED_MORE) {
       p = r + 1;
       return;
+    } else {
+      if (eof) throw UNREADABLE;
+      i = resume - refill(resume);
     }
-    if (eof) throw UNREADABLE;
-    i = resume - refill(resume);
   }
 }
 
@@ -685,6 +808,11 @@ function walk() {
   flush();
 }
 
+/** The window and the output buffer answerCases reads and writes through. */
+var winBuf = new Uint8Array(0);
+var outBuf = new Uint8Array(0);
+var outBufView = new DataView(outBuf.buffer);
+
 /**
  * Answers a whole cases file, a JSON array of {id, input}: writes the JSON array of the answers, one per case and in
  * the cases' order, as UTF-8 JSON bytes. read(buf, off, len, pos) reads the file's bytes from pos into buf at off and
@@ -694,13 +822,22 @@ function walk() {
  * the caller then answers that file with run().
  */
 export function answerCases(read, write, window = 1 << 20, outWindow = 1 << 20) {
+  // The same buffers for every file (at least as large as main()'s), so that every file is read by the same reader.
+  const winBytes = Math.max(window, 1 << 20) + PAD;
+  const outBytes = Math.max(outWindow + 4 * window, 5 << 20) + (1 << 12);
+  if (winBuf.length < winBytes) winBuf = new Uint8Array(winBytes);
+  if (outBuf.length < outBytes) {
+    outBuf = new Uint8Array(outBytes);
+    outBufView = new DataView(outBuf.buffer);
+  }
   readFn = read;
   writeFn = write;
   srcBase = 0;
   eof = false;
-  setWindow(new Uint8Array(window + PAD), 0, false);
-  out = new Uint8Array(outWindow + 4 * window + (1 << 12));
-  outView = new DataView(out.buffer);
+  cap = window;
+  setWindow(winBuf, 0, false);
+  out = outBuf;
+  outView = outBufView;
   o = 0;
   outBase = 0;
   outLimit = outWindow;
@@ -732,6 +869,7 @@ export function run(input) {
   const lit = JSON.stringify(t);
   const bytes = new Uint8Array(lit.length * 3 + PAD);
   const n = encoder.encodeInto(lit, bytes).written;
+  cap = n;
   setWindow(bytes, n, true);
   out = new Uint8Array(3 * n + 256);
   outView = new DataView(out.buffer);
@@ -742,7 +880,7 @@ export function run(input) {
   beginCase();
   let i = 1;
   if (bytes[1] === 0xef && bytes[2] === 0xbb && bytes[3] === 0xbf) i = 4;
-  readCore(i);
+  while (reader()(i) === MOVED) i = resume;
   writeAnswer(header);
   const answer = JSON.parse(decoder.decode(out.subarray(0, o)));
   setWindow(new Uint8Array(PAD), 0, true);
@@ -762,7 +900,8 @@ var WARM_TEXTS = [
   '\uFEFFa,b,c\n\nd,"e""f",g\n"h\ni\rj k","l,m n é",o\n"p"q x"y,s,t,u\n\nv,w\rx\n"y"\n"z","""a",b"c\n\n,\n' +
     '"東京",xy,\nq,r,"s"kg\n"",x,y\n"open,a,b\nc,d',
   'a,b\r\n"c",d\r\n\r\ne\r\n"f\r\ng\rh",i,j\r\nk\rl,m\r\nn,"o" cm\r\n"f"!',
-  'abcdefgh,"ijklmnopq","rs",tu,"v\nw"\nx\n',
+  'abcdefgh,"ijklmnopq","rs",tu,"v\nw"\nx\nabcdefghijklmnopqrstuvwxyz0123456789,"abcdefghijklmnopqrstuvwxyz0123456789 abcdefghijklmnopqrstuvwxyz",x\n',
+  '"a"\r\n"b","c\t\\"\r\nd\t\\,"e"',
 ];
 
 /** Runs the reader over WARM_TEXTS as a cases file read through windows of a few bytes; what it writes is thrown away. */
@@ -787,10 +926,16 @@ function warmUp(windows) {
  * depend on it.
  */
 export function prepare(setFlags) {
-  // The reader is one long function: without inlining or loop peeling V8 compiles it in less time, and it runs no
-  // slower.
+  // The reader is compiled once, as the run's first case begins, and its compile costs about a third as much CPU as
+  // the reading itself. Without inlining, loop peeling, escape analysis, load and store elimination or jump threading,
+  // V8 compiles it in about a fifth less time, and it runs about as fast: it allocates nothing, and calls only what is
+  // rare.
   setFlags('--no-turbo-inlining');
   setFlags('--no-turbo-loop-peeling');
+  setFlags('--no-turbo-escape');
+  setFlags('--no-turbo-load-elimination');
+  setFlags('--no-turbo-store-elimination');
+  setFlags('--no-turbo-jt');
   // Nothing else is hot for long: V8 would compile the error writers and the like with TurboFan halfway through a
   // file, at more cost than it saves.
   setFlags('--invocation-count-for-turbofan=100000');
@@ -799,7 +944,7 @@ export function prepare(setFlags) {
   try {
     // Compiled at its next call, the first case's, before it reads a byte.
     setFlags('--allow-natives-syntax');
-    new Function('f', '%PrepareFunctionForOptimization(f); %OptimizeFunctionOnNextCall(f);')(readCore);
+    new Function('f', '%PrepareFunctionForOptimization(f); %OptimizeFunctionOnNextCall(f);')(core);
   } catch {
     // Without natives syntax V8 optimises the reader on its own, a little later.
   }
@@ -808,18 +953,35 @@ export function prepare(setFlags) {
 // ---- The driver ----
 
 /**
+ * node:v8's setFlagsFromString, taken from the v8 binding the module wraps: loading node:v8 itself loads its heap
+ * snapshot and stream helpers too, which costs more CPU than the flags save. The binding is a deprecated way in
+ * (DEP0111), so deprecation warnings are turned off first, as nothing else here would print one; node:v8 when it is
+ * not there.
+ */
+function flagSetter() {
+  try {
+    process.noDeprecation = true;
+    const set = process.binding('v8').setFlagsFromString;
+    if (typeof set === 'function') return set;
+  } catch {
+    // No binding: node:v8 below.
+  }
+  return process.getBuiltinModule('node:v8').setFlagsFromString;
+}
+
+/**
  * What main.ts runs: reads every case from /input/cases.json, answers each one alone and writes /output/answers.json,
  * a JSON array of the answers, one per case and in the cases' order (MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand
  * in for /input and /output outside a container). The file is read a window at a time by answerCases; a file it does
- * not read is answered the plain way: JSON.parse, run() on each case's input, JSON.stringify. node:fs and node:v8
- * come by process.getBuiltinModule, so this module imports nothing.
+ * not read is answered the plain way: JSON.parse, run() on each case's input, JSON.stringify. node:fs comes by
+ * process.getBuiltinModule and the flag setter by flagSetter(), so this module imports nothing.
  */
 export function main() {
   const fs = process.getBuiltinModule('node:fs');
-  const v8 = process.getBuiltinModule('node:v8');
+  const setFlags = flagSetter();
   // V8's incremental marking off, as the house baseline's driver runs (the rules let an entry tune V8's flags).
-  v8.setFlagsFromString('--no-incremental-marking');
-  prepare(v8.setFlagsFromString);
+  setFlags('--no-incremental-marking');
+  prepare(setFlags);
   const input = (process.env.MAKEFUN_INPUT_DIR ?? '/input') + '/cases.json';
   const output = (process.env.MAKEFUN_OUTPUT_DIR ?? '/output') + '/answers.json';
   const inFd = fs.openSync(input, 'r');
