@@ -2,7 +2,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use core::arch::wasm32::{
-    u8x16_bitmask, u8x16_eq, unreachable, v128, v128_load, v128_or, v128_store,
+    u8x16_bitmask, u8x16_eq, u8x16_splat, unreachable, v128, v128_load, v128_or, v128_store,
 };
 use core::panic::PanicInfo;
 
@@ -36,19 +36,6 @@ const JUNK_COMMA: u32 = 0;
 const JUNK_EOL: u32 = 1;
 const JUNK_EOF: u32 = 2;
 const JUNK_MORE: u32 = 3;
-
-#[repr(C, align(16))]
-struct SimdConsts {
-    comma: [u8; 16],
-    bslash: [u8; 16],
-    quote: [u8; 16],
-}
-
-static SIMD_CONSTS: SimdConsts = SimdConsts {
-    comma: [b','; 16],
-    bslash: [b'\\'; 16],
-    quote: [b'"'; 16],
-};
 
 #[repr(C, align(64))]
 struct State {
@@ -508,6 +495,22 @@ pub extern "C" fn state_ptr() -> usize {
 
 /// Register-lean streaming SIMD CSV reader: ONLY 5 hot GP locals (`ip`, `op`, `nf`, `line`, `sent8_ptr`)
 /// + 3 XMM locals (`v_comma`, `v_bslash`, `v_quote`), so V8 Liftoff keeps ALL hot state in x86 registers!
+#[cold]
+#[inline(never)]
+unsafe fn drain_rest_commas(base_ip: *const u8, mut op: *mut u8, mut pos: usize, mut mc: u32) -> (*mut u8, usize) {
+    while mc != 0 {
+        let next_bit = mc.trailing_zeros() as usize;
+        v128_store(op as *mut v128, v128_load(base_ip.add(pos) as *const v128));
+        v128_store(op.add(16) as *mut v128, v128_load(base_ip.add(pos + 16) as *const v128));
+        op = op.add(next_bit - pos);
+        write_u32(op, 0x0022_2C22);
+        op = op.add(3);
+        pos = next_bit + 1;
+        mc &= mc - 1;
+    }
+    (op, pos)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn read_window() -> i32 {
     let in_base = S.in_base as *const u8;
@@ -538,9 +541,9 @@ pub unsafe extern "C" fn read_window() -> i32 {
     let mut width = S.width;
     S.status = 0;
 
-    let v_comma = core::ptr::read_volatile(SIMD_CONSTS.comma.as_ptr() as *const v128);
-    let v_bslash = core::ptr::read_volatile(SIMD_CONSTS.bslash.as_ptr() as *const v128);
-    let v_quote = core::ptr::read_volatile(SIMD_CONSTS.quote.as_ptr() as *const v128);
+    let v_comma = u8x16_splat(b',');
+    let v_bslash = u8x16_splat(b'\\');
+    let v_quote = u8x16_splat(b'"');
 
     'record: loop {
         if (op as u32) > S.out_limit_ptr {
@@ -572,6 +575,8 @@ pub unsafe extern "C" fn read_window() -> i32 {
                 line += 1;
                 q = read_u32(ip);
             }
+            S.rec_ip = ip as u32;
+            S.rec_line = line;
         }
 
         if (q & 0xFF) == 0x22 {
@@ -580,9 +585,6 @@ pub unsafe extern "C" fn read_window() -> i32 {
             }
             { S.kept = kept; return rollback_ret(); }
         }
-
-        S.rec_ip = ip as u32;
-        S.rec_line = line;
 
         if kept >= 2 {
             write_u32(op, 0x0022_5B2C); // ,["
@@ -611,16 +613,19 @@ pub unsafe extern "C" fn read_window() -> i32 {
         'field: loop {
             if !go_quoted {
                 'unq: loop {
-                    let v = v128_load(ip as *const v128);
-                    v128_store(op as *mut v128, v);
-                    let m_comma = u8x16_bitmask(u8x16_eq(v, v_comma)) as u32;
-                    let m_spec =
-                        u8x16_bitmask(v128_or(u8x16_eq(v, v_bslash), u8x16_eq(v, v_quote))) as u32;
+                    let v0 = v128_load(ip as *const v128);
+                    let v1 = v128_load(ip.add(16) as *const v128);
+                    v128_store(op as *mut v128, v0);
+                    v128_store(op.add(16) as *mut v128, v1);
+                    let m_comma = (u8x16_bitmask(u8x16_eq(v0, v_comma)) as u32)
+                        | ((u8x16_bitmask(u8x16_eq(v1, v_comma)) as u32) << 16);
+                    let m_spec = (u8x16_bitmask(v128_or(u8x16_eq(v0, v_bslash), u8x16_eq(v0, v_quote))) as u32)
+                        | ((u8x16_bitmask(v128_or(u8x16_eq(v1, v_bslash), u8x16_eq(v1, v_quote))) as u32) << 16);
 
                     if m_spec == 0 {
                         if m_comma == 0 {
-                            ip = ip.add(16);
-                            op = op.add(16);
+                            ip = ip.add(32);
+                            op = op.add(32);
                             continue 'unq;
                         }
                         let base_ip = ip;
@@ -632,23 +637,40 @@ pub unsafe extern "C" fn read_window() -> i32 {
                         let mut pos = bit0 + 1;
                         let mut mc = m_comma & (m_comma - 1);
 
-                        while mc != 0 {
-                            let next_bit = mc.trailing_zeros() as usize;
+                        if mc != 0 {
+                            let nb = mc.trailing_zeros() as usize;
                             v128_store(op as *mut v128, v128_load(base_ip.add(pos) as *const v128));
-                            op = op.add(next_bit - pos);
-                            write_u32(op, 0x0022_2C22); // ","
+                            v128_store(op.add(16) as *mut v128, v128_load(base_ip.add(pos + 16) as *const v128));
+                            op = op.add(nb - pos);
+                            write_u32(op, 0x0022_2C22);
                             op = op.add(3);
-                            pos = next_bit + 1;
+                            pos = nb + 1;
                             mc &= mc - 1;
+                            if mc != 0 {
+                                let nb = mc.trailing_zeros() as usize;
+                                v128_store(op as *mut v128, v128_load(base_ip.add(pos) as *const v128));
+                                v128_store(op.add(16) as *mut v128, v128_load(base_ip.add(pos + 16) as *const v128));
+                                op = op.add(nb - pos);
+                                write_u32(op, 0x0022_2C22);
+                                op = op.add(3);
+                                pos = nb + 1;
+                                mc &= mc - 1;
+                                if mc != 0 {
+                                    let (op2, pos2) = drain_rest_commas(base_ip, op, pos, mc);
+                                    op = op2;
+                                    pos = pos2;
+                                }
+                            }
                         }
 
-                        if pos < 16 {
+                        if pos < 32 {
                             v128_store(op as *mut v128, v128_load(base_ip.add(pos) as *const v128));
-                            op = op.add(16 - pos);
-                            ip = base_ip.add(16);
+                            v128_store(op.add(16) as *mut v128, v128_load(base_ip.add(pos + 16) as *const v128));
+                            op = op.add(32 - pos);
+                            ip = base_ip.add(32);
                             continue 'unq;
                         }
-                        ip = base_ip.add(16);
+                        ip = base_ip.add(32);
                         S.field_start = op as u32;
                         if read_u16(ip) == 0x225C {
                             if ip > sent8_ptr {
@@ -676,19 +698,36 @@ pub unsafe extern "C" fn read_window() -> i32 {
                         let mut pos = bit0 + 1;
                         mc &= mc - 1;
 
-                        while mc != 0 {
-                            let next_bit = mc.trailing_zeros() as usize;
+                        if mc != 0 {
+                            let nb = mc.trailing_zeros() as usize;
                             v128_store(op as *mut v128, v128_load(base_ip.add(pos) as *const v128));
-                            op = op.add(next_bit - pos);
-                            write_u32(op, 0x0022_2C22); // ","
+                            v128_store(op.add(16) as *mut v128, v128_load(base_ip.add(pos + 16) as *const v128));
+                            op = op.add(nb - pos);
+                            write_u32(op, 0x0022_2C22);
                             op = op.add(3);
-                            pos = next_bit + 1;
+                            pos = nb + 1;
                             mc &= mc - 1;
+                            if mc != 0 {
+                                let nb = mc.trailing_zeros() as usize;
+                                v128_store(op as *mut v128, v128_load(base_ip.add(pos) as *const v128));
+                                v128_store(op.add(16) as *mut v128, v128_load(base_ip.add(pos + 16) as *const v128));
+                                op = op.add(nb - pos);
+                                write_u32(op, 0x0022_2C22);
+                                op = op.add(3);
+                                pos = nb + 1;
+                                mc &= mc - 1;
+                                if mc != 0 {
+                                    let (op2, pos2) = drain_rest_commas(base_ip, op, pos, mc);
+                                    op = op2;
+                                    pos = pos2;
+                                }
+                            }
                         }
 
                         let seg = spec_bit - pos;
                         if seg > 0 {
                             v128_store(op as *mut v128, v128_load(base_ip.add(pos) as *const v128));
+                            v128_store(op.add(16) as *mut v128, v128_load(base_ip.add(pos + 16) as *const v128));
                             op = op.add(seg);
                         } else {
                             ip = base_ip.add(spec_bit);
@@ -714,15 +753,33 @@ pub unsafe extern "C" fn read_window() -> i32 {
                             { S.kept = kept; return rollback_ret(); }
                         }
                         let q = read_u32(ip);
-                        if (q & 0xFFFF) == 0x6E5C {
-                            ip = ip.add(2);
+                        let eol_adv = if (q & 0xFFFF) == 0x6E5C {
+                            2usize
+                        } else if q == 0x6E5C_725C {
+                            4usize
+                        } else {
+                            0usize
+                        };
+                        if eol_adv != 0 {
+                            ip = ip.add(eol_adv);
                             line += 1;
-                            ended = ENDED_EOL;
-                            break 'field;
-                        }
-                        if q == 0x6E5C_725C {
-                            ip = ip.add(4);
-                            line += 1;
+                            if nf != 0 && nf + 1 == width && kept >= 2 && (op as u32) <= S.out_limit_ptr {
+                                let nc = *ip;
+                                if nc != b'"' && nc != b'\\' {
+                                    write_u32(op, 0x5B2C_5D22); // "],[
+                                    *op.add(4) = b'"';
+                                    op = op.add(5);
+                                    kept += 1;
+                                    S.rec_ip = ip as u32;
+                                    S.rec_op = (op as u32) - 3;
+                                    S.rec_nerr = S.nerr;
+                                    S.rec_line = line;
+                                    S.field_start = op as u32;
+                                    S.first_quoted = 0;
+                                    nf = 0;
+                                    continue 'unq;
+                                }
+                            }
                             ended = ENDED_EOL;
                             break 'field;
                         }
@@ -758,15 +815,18 @@ pub unsafe extern "C" fn read_window() -> i32 {
             // ---- QUOTED SIMD LOOP ----
             'quo: loop {
                 let mask = loop {
-                    let v = v128_load(ip as *const v128);
-                    v128_store(op as *mut v128, v);
-                    let m = v128_or(u8x16_eq(v, v_bslash), u8x16_eq(v, v_quote));
-                    let mask = u8x16_bitmask(m) as u32;
+                    let v0 = v128_load(ip as *const v128);
+                    let v1 = v128_load(ip.add(16) as *const v128);
+                    v128_store(op as *mut v128, v0);
+                    v128_store(op.add(16) as *mut v128, v1);
+                    let m0 = u8x16_bitmask(v128_or(u8x16_eq(v0, v_bslash), u8x16_eq(v0, v_quote))) as u32;
+                    let m1 = u8x16_bitmask(v128_or(u8x16_eq(v1, v_bslash), u8x16_eq(v1, v_quote))) as u32;
+                    let mask = m0 | (m1 << 16);
                     if mask != 0 {
                         break mask;
                     }
-                    ip = ip.add(16);
-                    op = op.add(16);
+                    ip = ip.add(32);
+                    op = op.add(32);
                 };
                 let n = mask.trailing_zeros() as usize;
                 ip = ip.add(n);
@@ -804,15 +864,34 @@ pub unsafe extern "C" fn read_window() -> i32 {
                     if (q & 0xFFFF) == 0x225C {
                         ip = ip.add(2);
                         let q2 = read_u32(ip);
-                        if (q2 & 0xFFFF) == 0x6E5C {
-                            ip = ip.add(2);
+                        let eol_adv = if (q2 & 0xFFFF) == 0x6E5C {
+                            2usize
+                        } else if q2 == 0x6E5C_725C {
+                            4usize
+                        } else {
+                            0usize
+                        };
+                        if eol_adv != 0 {
+                            ip = ip.add(eol_adv);
                             line += 1;
-                            ended = ENDED_EOL;
-                            break 'field;
-                        }
-                        if q2 == 0x6E5C_725C {
-                            ip = ip.add(4);
-                            line += 1;
+                            if nf != 0 && nf + 1 == width && kept >= 2 && (op as u32) <= S.out_limit_ptr {
+                                let nc = *ip;
+                                if nc != b'"' && nc != b'\\' {
+                                    write_u32(op, 0x5B2C_5D22); // "],[
+                                    *op.add(4) = b'"';
+                                    op = op.add(5);
+                                    kept += 1;
+                                    S.rec_ip = ip as u32;
+                                    S.rec_op = (op as u32) - 3;
+                                    S.rec_nerr = S.nerr;
+                                    S.rec_line = line;
+                                    S.field_start = op as u32;
+                                    S.first_quoted = 0;
+                                    nf = 0;
+                                    go_quoted = false;
+                                    break 'quo;
+                                }
+                            }
                             ended = ENDED_EOL;
                             break 'field;
                         }

@@ -1,1 +1,1 @@
-import{main}from'./solve.js';main()
+require('./s.cjs')
